@@ -8,12 +8,13 @@ import time
 import numpy
 import lifx
 import matplotlib.pyplot as plt
+import onoff
 
 import lightutil
 
 numpy.set_printoptions(threshold=numpy.inf)
 
-PLOT = True
+PLOT = False
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
@@ -27,7 +28,7 @@ SLEEP_TIME = 0.2
 # Account for noise:
 # There must be at least one fourier value greater than this to consider
 # the signal to be anything but noise.
-background_noise_threshold = 1000.0
+background_noise_threshold = 20.0
 
 # Account for noise:
 # Any stand-out frequencies lower than this will be ignored.
@@ -41,12 +42,6 @@ greater_than_avg_count = 10000#100
 
 min_freq = None
 max_freq = None
-
-IP = "255.255.255.255"
-PORT = 56700
-
-lamp_state_unknown = True
-lamp_on = False
 
 buf_mutex = threading.Lock()
 
@@ -63,72 +58,14 @@ def freq_to_color(f):
     #print("color: " + str(b) + " freq: " + str(f) + " val: " + str(i))
     return b
 
-# on - state = True, off - state = False
-def set_lamp(state):
-    global s
-    global lamp_on
-    global lamp_state_unknown
-    if state:
-        print("Lights on")
-    else:
-        print("Lights off")
-
-    if lamp_state_unknown:
-        s.sendto(lifx.set_power_packet(state), (IP, PORT))
-        p = s.recv(48)
-        lamp_on = lifx.get_power_from_state_packet(p)
-        lamp_state_unknown = False
-
-    while lamp_on != state:
-        s.sendto(lifx.set_power_packet(state), (IP, PORT))
-        p = s.recv(48)
-        s.sendto(lifx.get_power_packet(), (IP, PORT))
-        p = s.recv(48)
-        lamp_on = lifx.get_power_from_state_packet(p)
-
-def turn_on_lamp():
-    return set_lamp(True)
-
-def turn_off_lamp():
-    return set_lamp(False)
-
 def turn_off_and_exit(sig_num, stack_frame):
+    global s, on_off_thread
     print("\nGoodbye! Turning off lamp")
-    turn_off_lamp()
+    onoff.turn_off_lamp(s)
+    onoff.app_running = False
+    #on_off_thread.join()
+    p.terminate()
     exit(0)
-
-def resonance_transform(freqs, fourier):
-    max_val = float(max(fourier))
-    n = len(fourier)
-    seen = list()
-    resonance = [0] * n
-    for i in range(1, n):
-        k = n - i
-        resonance[k] = float(fourier[k]) / max_val
-        seen_del = list()
-        for j in seen:
-            if freqs[k] < freqs[j] and (freqs[j] % freqs[k]) == 0:
-                resonance[k] *= resonance[j]
-                seen_del.append(j)
-        for j in seen_del:
-            seen.remove(j)
-        seen.append(k)
-    return list(map(lambda x: max_val * x, resonance))
-
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-s.bind(("0.0.0.0", PORT))
-turn_on_lamp()
-
-p = pyaudio.PyAudio()
-
-plt.ion()
-plt.show()
-
-combined = bytearray()
-iteration = 0
-
-signal.signal(signal.SIGINT, turn_off_and_exit)
 
 def plot(plt, x, y_list):
     if PLOT:
@@ -148,52 +85,30 @@ def callback(data, frame_count, time_info, status_flags):
 
     return (data, pyaudio.paContinue)
 
-stream = p.open(format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=CHUNK,
-                stream_callback=callback)
-
-while 1:
+def listen(s):
+    global combined, min_freq, max_freq
     time.sleep(SLEEP_TIME)
 
-    listen_bytes = int(numpy.ceil(RATE / CHUNK) * SAMPLE_EVERY)
     n_bytes = RATE*RECORD_SECONDS
     if len(combined) < n_bytes:
-        continue
+        return
 
     buf_mutex.acquire()
-    combined = combined[len(combined) - n_bytes:len(combined)]
-    process_buf = combined
+    new_bytes = bytearray()
+    for byte in combined[n_bytes:]:
+        new_bytes.append(byte)
+
+    combined = combined[-n_bytes:]
+    process_buf = bytearray()
+    for byte in combined:
+        process_buf.append(byte)
     buf_mutex.release()
-    """
-    for i in range(0, listen_bytes):
-        stream.stop_stream()
-        stream.close()
 
-        iteration += 1
-
-        if iteration <= 2: # first sampling is garbage
-            continue
-
-        n_bytes = RATE*RECORD_SECONDS
-        if len(combined) < n_bytes:
-            continue
-        else:
-            combined = combined[len(combined)-n_bytes:len(combined)]
-
-"""
     sig = numpy.frombuffer(process_buf, dtype='<i2').reshape(-1, CHANNELS)
-    sig = sig[0:n_bytes,0]
+    sig = sig[0:,0]
 
     # find frequency
     sig = sig / (2 ** 15)
-
-    if lightutil.clap_count(numpy.abs(sig)) > 1:
-        set_lamp(not lamp_on)
-        plot(plt, numpy.arange(len(sig)), [sig])
-        continue
 
     fourier = numpy.fft.fft(sig)
     freqs = numpy.fft.fftfreq(sig.size)
@@ -202,7 +117,7 @@ while 1:
     # only consider positive frequencies
     fourier = fourier[0:num_positive]
     freqs = freqs[0:num_positive]
-    fourier_real = list(numpy.absolute(fourier.real))
+    fourier_real = list(numpy.sqrt(fourier.real**2+fourier.imag**2))
 
     avg = numpy.average(fourier_real)
     max_f_val = numpy.max(fourier_real)
@@ -214,13 +129,6 @@ while 1:
                                    v[1] > metric(avg), freq_val_tuples)
         f_vals = list(map(lambda v: v[0], greater))
         if len(f_vals) > 0:
-            """
-            print("max: " + str(max_f_val) +
-                  " average: " + str(avg) +
-                  " num>avg: " + str(len(list(filter(lambda v: v > avg, fourier_real)))))
-            print("freq range: " + str(min_freq) + "-" + str(max_freq))
-            print("f_vals: " + str(f_vals))
-            """
             freq = f_vals[0]
 
             if freq > 0:
@@ -230,19 +138,52 @@ while 1:
                     max_freq = freq
                 if min_freq < max_freq:
                     color = freq_to_color(freq)
-                    s.sendto(lifx.set_color_packet(color), (IP, PORT))
+                    print("set color " + str(color))
+                    try:
+                        s.sendto(lifx.set_color_packet(color), (lifx.IP, lifx.PORT))
+                    except:
+                        print("Failed to send command to lifx bulb")
+                        return
 
                 scope = list(freqs).index(highest_human_freq)
-                #resonance = resonance_transform(freqs[0:scope], fourier_real[0:scope])
                 avg_list = [metric(avg)] * len(freqs)
                 avg2 = [avg] * len(freqs)
                 avg3 = [avg ** 2 + 200] * len(freqs)
                 avg4 = [avg ** 3 + 200] * len(freqs)
                 std = [avg + 3 * numpy.std(fourier_real)] * len(freqs)
                 plot(plt, freqs[0:scope], [fourier_real[0:scope], std[0:scope], avg_list[0:scope]])
-                #plt.plot(freqs[0:scope], resonance)
-                #plt.plot(freqs[0:scope], avg2[0:scope])
-                #plt.plot(freqs[0:scope], avg3[0:scope])
-                #plt.plot(freqs[0:scope], avg4[0:scope])
 
-p.terminate()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+s.bind(("0.0.0.0", lifx.PORT))
+
+p = pyaudio.PyAudio()
+
+plt.ion()
+plt.show()
+
+combined = bytearray()
+iteration = 0
+
+signal.signal(signal.SIGINT, turn_off_and_exit)
+
+stream = p.open(format=FORMAT,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+                stream_callback=callback)
+
+def listen_target(s, cv):
+    while True:
+        cv.acquire()
+        while not onoff.willy_present:
+            cv.wait()
+        listen(s)
+        cv.release()
+
+cv = threading.Condition()
+on_off_thread = threading.Thread(target=onoff.contact_willy, args=(s,cv,))
+listen_thread = threading.Thread(target=listen_target, args=(s, cv,))
+on_off_thread.start()
+listen_thread.start()

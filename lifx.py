@@ -1,3 +1,6 @@
+IP = "255.255.255.255"
+PORT = 56700
+
 set_color_hdr = bytes.fromhex('31 00 00 34 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 66 00 00 00')
 set_color_rsvd = bytes.fromhex('00')
 saturation = bytes.fromhex('FF FF')

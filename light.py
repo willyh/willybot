@@ -1,4 +1,5 @@
 import socket
+from time import sleep
 
 IP = "255.255.255.255"
 PORT = 56700
