@@ -9,19 +9,21 @@ import numpy
 import lifx
 import matplotlib.pyplot as plt
 import onoff
-
-import lightutil
+import willybot
 
 numpy.set_printoptions(threshold=numpy.inf)
 
 PLOT = False
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
+SAMPLE_WIDTH = 2 # bytes
 CHANNELS = 1
 RATE = 44100
-RECORD_SECONDS = 2
+FREQ_SECONDS = 2
+VOICE_SECONDS = 4
 SAMPLE_EVERY = 1
 SLEEP_TIME = 0.2
+MAX_MATCHING_FREQS = 100
 
 # willy custom values
 
@@ -33,12 +35,12 @@ background_noise_threshold = 20.0
 # Account for noise:
 # Any stand-out frequencies lower than this will be ignored.
 lowest_human_freq = 0.0016
-highest_human_freq = 0.05
+highest_human_freq = 0.4
 
 # Differ loud noise from tones:
 # Number of fourier values that must be greater than the average in order
 # to say there frequency that stands out.
-greater_than_avg_count = 10000#100
+greater_than_avg_count = 1000#100
 
 min_freq = None
 max_freq = None
@@ -59,12 +61,13 @@ def freq_to_color(f):
     return b
 
 def turn_off_and_exit(sig_num, stack_frame):
-    global s, on_off_thread
+    global sock, on_off_thread, program_killed
     print("\nGoodbye! Turning off lamp")
-    onoff.turn_off_lamp(s)
+    onoff.turn_off_lamp(sock)
     onoff.app_running = False
     #on_off_thread.join()
     p.terminate()
+    program_killed = True
     exit(0)
 
 def plot(plt, x, y_list):
@@ -77,33 +80,23 @@ def plot(plt, x, y_list):
         plt.pause(0.001)
 
 def callback(data, frame_count, time_info, status_flags):
-    global combined
+    global sound_buffer, buf_mutex
     buf_mutex.acquire()
     for byte in data:
-        combined.append(byte)
+        sound_buffer.append(byte)
     buf_mutex.release()
 
     return (data, pyaudio.paContinue)
 
-def listen(s):
-    global combined, min_freq, max_freq
-    time.sleep(SLEEP_TIME)
-
-    n_bytes = RATE*RECORD_SECONDS
-    if len(combined) < n_bytes:
-        return
-
+def flush_audio():
+    global sound_buffer, buf_mutex
     buf_mutex.acquire()
-    new_bytes = bytearray()
-    for byte in combined[n_bytes:]:
-        new_bytes.append(byte)
-
-    combined = combined[-n_bytes:]
-    process_buf = bytearray()
-    for byte in combined:
-        process_buf.append(byte)
+    sound_buffer.clear()
     buf_mutex.release()
 
+
+def set_freq_color(sock, process_buf):
+    global min_freq, max_freq
     sig = numpy.frombuffer(process_buf, dtype='<i2').reshape(-1, CHANNELS)
     sig = sig[0:,0]
 
@@ -126,9 +119,11 @@ def listen(s):
         freq_val_tuples = map(lambda v: (freqs[v[0]], v[1]), enumerate(fourier_real))
         greater = filter(lambda v: v[0] > lowest_human_freq and
                                    v[0] < highest_human_freq and
-                                   v[1] > metric(avg), freq_val_tuples)
+                                   v[1] > background_noise_threshold,
+                                   freq_val_tuples)
         f_vals = list(map(lambda v: v[0], greater))
-        if len(f_vals) > 0:
+        print(len(f_vals))
+        if len(f_vals) > 0 and len(f_vals) <= MAX_MATCHING_FREQS:
             freq = f_vals[0]
 
             if freq > 0:
@@ -140,29 +135,40 @@ def listen(s):
                     color = freq_to_color(freq)
                     print("set color " + str(color))
                     try:
-                        s.sendto(lifx.set_color_packet(color), (lifx.IP, lifx.PORT))
+                        sock.sendto(lifx.set_color_packet(color), (lifx.IP, lifx.PORT))
                     except:
                         print("Failed to send command to lifx bulb")
-                        return
 
-                scope = list(freqs).index(highest_human_freq)
-                avg_list = [metric(avg)] * len(freqs)
-                avg2 = [avg] * len(freqs)
-                avg3 = [avg ** 2 + 200] * len(freqs)
-                avg4 = [avg ** 3 + 200] * len(freqs)
-                std = [avg + 3 * numpy.std(fourier_real)] * len(freqs)
-                plot(plt, freqs[0:scope], [fourier_real[0:scope], std[0:scope], avg_list[0:scope]])
+                    scope = list(freqs).index(highest_human_freq)
+                    avg_list = [metric(avg)] * len(freqs)
+                    std = [avg + 3 * numpy.std(fourier_real)] * len(freqs)
+                    plot(plt, freqs[0:scope], [fourier_real[0:scope], std[0:scope], avg_list[0:scope]])
 
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-s.bind(("0.0.0.0", lifx.PORT))
+def pull_new_bytes(buf_mutex):
+    global sound_buffer
+    n_bytes = RATE*max(VOICE_SECONDS, FREQ_SECONDS)
+    buf_mutex.acquire()
+    if len(sound_buffer) < n_bytes:
+        buf_mutex.release()
+        return bytearray()
+
+    sound_buffer = sound_buffer[-n_bytes:]
+    process_buf = bytearray()
+    for byte in sound_buffer:
+        process_buf.append(byte)
+    buf_mutex.release()
+    return process_buf
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+sock.bind(("0.0.0.0", lifx.PORT))
 
 p = pyaudio.PyAudio()
 
 plt.ion()
 plt.show()
 
-combined = bytearray()
+sound_buffer = bytearray()
 iteration = 0
 
 signal.signal(signal.SIGINT, turn_off_and_exit)
@@ -174,16 +180,24 @@ stream = p.open(format=FORMAT,
                 frames_per_buffer=CHUNK,
                 stream_callback=callback)
 
-def listen_target(s, cv):
-    while True:
-        cv.acquire()
-        while not onoff.willy_present:
-            cv.wait()
-        listen(s)
-        cv.release()
+onoff.turn_on_lamp(sock)
+light_on = True
+program_killed = False
+while not program_killed:
+    process_buf = pull_new_bytes(buf_mutex)
+    if len(process_buf) == 0:
+        time.sleep(SLEEP_TIME)
+        continue
 
-cv = threading.Condition()
-on_off_thread = threading.Thread(target=onoff.contact_willy, args=(s,cv,))
-listen_thread = threading.Thread(target=listen_target, args=(s, cv,))
-on_off_thread.start()
-listen_thread.start()
+    if light_on:
+        freq_buf = process_buf[-RATE*FREQ_SECONDS:]
+        set_freq_color(sock, freq_buf)
+
+    voice_buf = process_buf[-RATE*VOICE_SECONDS:]
+    if willybot.lights_command_given(sock, voice_buf, RATE, SAMPLE_WIDTH):
+        if light_on:
+            onoff.turn_off_lamp(sock)
+        else:
+            onoff.turn_on_lamp(sock)
+        light_on = not light_on
+        flush_audio() # We don't want to process the command twice

@@ -21,6 +21,7 @@ def get_power_packet():
 
 def get_power_from_state_packet(p):
     #print(p)
+    # TODO: check that response packet is valid (has lifx header)
     p_len = p[0]
     power = int.from_bytes(p[36:38], "big")
     #print(power)
