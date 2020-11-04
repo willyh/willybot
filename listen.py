@@ -62,10 +62,10 @@ def freq_to_color(f):
 
 def turn_off_and_exit(sig_num, stack_frame):
     global sock, on_off_thread, program_killed
-    print("\nGoodbye! Turning off lamp")
-    onoff.turn_off_lamp(sock)
+    if not program_killed:
+        print("\nGoodbye! Turning off lamp")
+        onoff.turn_off_lamp(sock)
     onoff.app_running = False
-    #on_off_thread.join()
     p.terminate()
     program_killed = True
     exit(0)

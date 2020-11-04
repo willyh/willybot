@@ -1,15 +1,6 @@
-#from scapy.all import IP, ICMP, sr1
 import time
-import threading
 import lifx
-import subprocess
-import signal
-from willybot import wait_command
 
-WILLY_IP = "192.168.1.15"
-TIMEOUT = 1
-willy_present = False
-app_running = True
 lamp_state_unknown = True
 lamp_on = False
 

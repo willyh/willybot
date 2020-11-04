@@ -2,7 +2,7 @@ import speech_recognition as sr
 
 # Value between 0 and 1 (inclusive).
 # Lower this if willybot is hearing too few words
-STRICTNESS = 0.9
+STRICTNESS = 0.99
 
 def any_in(words, sentence):
     return len(words) == 0 or True in map(lambda w: w in sentence, words)

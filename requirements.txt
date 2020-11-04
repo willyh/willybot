@@ -1,0 +1,5 @@
+PyAudio
+numpy
+pocketsphinx
+matplotlib
+SpeechRecognition
